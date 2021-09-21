@@ -10,7 +10,7 @@ int main(int argc, char *argv[])
     QCoreApplication::setApplicationVersion("0.1");
 
     QCommandLineParser parser;
-    parser.setApplicationDescription("Program for gettin system information");
+    parser.setApplicationDescription("Programm for gettin system information");
     parser.addHelpOption();
     parser.addVersionOption();
 
@@ -27,12 +27,12 @@ int main(int argc, char *argv[])
       qDebug() << "asdfasfasfas";
     }
 
-   // QTimer *Timer = new QTimer();
+    QTimer *Timer = new QTimer();
 
-  //  a.
+    a.
 
 
-//    Timer->setInterval()
+    Timer->setInterval()
 
 
     return a.exec();

@@ -81,3 +81,10 @@ void TSystemInfo::Print()
         qDebug() << Item.first << Item.second;
     }
 }
+
+void TSystemInfo::StartGetInformation()
+{
+    Updata();
+    SaveToDB();
+    emit  GetInformationComplite();
+}

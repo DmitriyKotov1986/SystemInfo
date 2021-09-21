@@ -31,6 +31,14 @@ public:
     void SaveToDB();
 
     void Print();
+
+public slots:
+    void StartGetInformation();
+
+signals:
+    void GetInformationComplite();
+
 };
+
 
 #endif // TSYSTEMINFO_H
