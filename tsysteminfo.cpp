@@ -3,6 +3,8 @@
 #include <QtDebug>
 #include <QSettings>
 #include <QTextStream>
+#include <QSqlQuery>
+#include <QSqlError>
 
 QString TSystemInfo::NextKey(const QString & OldKey) { //генерирует имя для нового ключа
     if (!CurrentNumberKey.contains(OldKey)) {
@@ -13,6 +15,22 @@ QString TSystemInfo::NextKey(const QString & OldKey) { //генерирует и
        ++CurrentNumberKey[OldKey];
        return OldKey + "/" + QString::number(CurrentNumberKey[OldKey]);
     }
+}
+
+void TSystemInfo::SendLogMsg(uint16_t Code, const QString &Msg)
+{
+    QSqlQuery QueryLog(DB);
+    DB.transaction();
+    QString QueryText = "INSERT INTO LOG ( CAT, SENDER, MSG) VALUES ( "
+                        + QString::number(Code) + ", "
+                        "\'SystemMonitor\', "
+                        "\'" + Msg +"\'"
+                        ")";
+
+     if (!QueryLog.exec(QueryText)) {
+        qDebug() << "FAIL Cannot execute query. Error: " << QueryLog.lastError().text();
+    }
+    DB.commit();
 }
 
 void TSystemInfo::Parser(const QString &Group, const QByteArray &str)
@@ -35,12 +53,30 @@ void TSystemInfo::Parser(const QString &Group, const QByteArray &str)
 TSystemInfo::TSystemInfo(const QString &FileName)
     : Config(FileName, QSettings::IniFormat)
 {
-  // DB.addDatabase(Config);
+    Config.beginGroup("DATABASE");
+
+    DB = QSqlDatabase::addDatabase(Config.value("Driver", "QODBC").toString(), "MainDB");
+    DB.setDatabaseName(Config.value("DataBase", "SystemMonitorDB").toString());
+    DB.setUserName(Config.value("UID", "SYSDBA").toString());
+    DB.setPassword(Config.value("PWD", "MASTERKEY").toString());
+    DB.setConnectOptions(Config.value("ConnectionOprions", "").toString());
+    DB.setPort(Config.value("Port", "3051").toUInt());
+    DB.setHostName(Config.value("Host", "localhost").toString());
+
+    Config.endGroup();
+
+    if (!DB.open()) {
+        qDebug() << "FAIL. Cannot connect to database. Error: " << DB.lastError().text();
+    };
+
+    SendLogMsg(MSG_CODE::CODE_OK, "Start is succesfull");
+
 }
 
 TSystemInfo::~TSystemInfo()
 {
-
+    SendLogMsg(MSG_CODE::CODE_OK, "Finished");
+    DB.close();
 }
 
 void TSystemInfo::Updata()
@@ -82,9 +118,35 @@ void TSystemInfo::Print()
     }
 }
 
+void TSystemInfo::SaveToDB()
+{
+    QSqlQuery QueryAdd(DB);
+    DB.transaction();
+    QString QueryText = "INSERT INTO LOG ( CAT, SENDER, MSG) VALUES ( "
+                        + QString::number(Code) + ", "
+                        "\'SystemMonitor\', "
+                        "\'" + Msg +"\'"
+                        ")";
+
+     if (!QueryAdd.exec(QueryText)) {
+        qDebug() << "FAIL Cannot execute query. Error: " << QueryAdd.lastError().text();
+    }
+    DB.commit();
+
+}
+
 void TSystemInfo::StartGetInformation()
 {
-    Updata();
-    SaveToDB();
+    try {
+        Updata();
+        SaveToDB();
+     //   Print();
+        SendLogMsg(MSG_CODE::CODE_OK, "Getting information is succesfull");
+        qDebug() << "OK";
+    }
+    catch (...) {
+        qDebug() << "FAIL";
+        SendLogMsg(MSG_CODE::CODE_ERROR, "Getting information is fail");
+    }
     emit  GetInformationComplite();
 }
