@@ -5,32 +5,44 @@
 #include <QTextStream>
 #include <QSqlQuery>
 #include <QSqlError>
+#include <QException>
+#include <QRegularExpression>
+#include <QtCore5Compat/QTextCodec> //Если этот модуль не найден, нужно установить Qt 5 Compatibility Module
 
-QString TSystemInfo::NextKey(const QString & OldKey) { //генерирует имя для нового ключа
+uint32_t TSystemInfo::NextKey(const QString & OldKey) { //генерирует имя для нового ключа
     if (!CurrentNumberKey.contains(OldKey)) {
         CurrentNumberKey.insert(OldKey, 0);
-        return OldKey + "/0";
+        return 0;
     }
     else {
        ++CurrentNumberKey[OldKey];
-       return OldKey + "/" + QString::number(CurrentNumberKey[OldKey]);
+       return CurrentNumberKey[OldKey];
     }
 }
 
 void TSystemInfo::SendLogMsg(uint16_t Code, const QString &Msg)
 {
+    QString Str(Msg);
+    Str.replace(QRegularExpression("'"), "''");
+   // qDebug() << Str;
     QSqlQuery QueryLog(DB);
     DB.transaction();
-    QString QueryText = "INSERT INTO LOG ( CAT, SENDER, MSG) VALUES ( "
+    QString QueryText = "INSERT INTO LOG (CATEGORY, SENDER, MSG) VALUES ( "
                         + QString::number(Code) + ", "
                         "\'SystemMonitor\', "
-                        "\'" + Msg +"\'"
+                        "\'" + Str +"\'"
                         ")";
 
      if (!QueryLog.exec(QueryText)) {
-        qDebug() << "FAIL Cannot execute query. Error: " << QueryLog.lastError().text();
+        qDebug() << "FAIL Cannot execute query. Error: " << QueryLog.lastError().text() << " Query: "<< QueryLog.lastQuery();
+        DB.rollback();
+        return;
     }
-    DB.commit();
+    if (!DB.commit()) {
+        qDebug() << "FAIL Cannot commit transation. Error: " << DB.lastError().text();
+        DB.rollback();
+        return;
+    };
 }
 
 void TSystemInfo::Parser(const QString &Group, const QByteArray &str)
@@ -41,11 +53,25 @@ void TSystemInfo::Parser(const QString &Group, const QByteArray &str)
       QString tmp = TS.readLine();
       if (tmp != "\r") {
         size_t position = tmp.indexOf('=');
-        QString Key = tmp.left(position);
-        QString Value = tmp.right(tmp.length() - position - 1);
-        Value.chop(1);
-        Key = NextKey(Group + "/" + Key);
-        Info.insert(Key, Value);
+
+        TPathInfo Path;
+        Path.Category = Group;
+        Path.Name = tmp.left(position);
+        Path.Number = NextKey(Path.Category + "/" + Path.Name);
+
+        TInfo Value;
+        Value.Value = tmp.right(tmp.length() - position - 1);
+        Value.Value.chop(1);
+        if (Value.Value == "") Value.Value = "n/a";
+        Value.DateTime = QDateTime::currentDateTime();
+
+        if (Info.find(Path) != Info.end()) {
+            if (!(Info[Path].Value != Value.Value)) Value.UpDate = true;
+        }
+        else  {
+            Value.UpDate = true;
+            Info.insert(Path, Value);
+        }
       }
     }
 }
@@ -84,6 +110,7 @@ void TSystemInfo::Updata()
     //получаем путь к файлу с командой wnim
     Config.beginGroup("SYSTEM_INFO");
     QString WMICFileName = Config.value("wmic", "").toString();
+    QString CMDCodePage = Config.value("CodePage", "IBM 866").toString();
     uint32_t GroupListCount = Config.value("GroupCount", 0).toUInt();
     QStringList GroupList;
     for (uint32_t i = 0; i < GroupListCount; ++i) GroupList << Config.value("Group" + QString::number(i), "").toString();
@@ -106,7 +133,9 @@ void TSystemInfo::Updata()
         cmd->start(WMICFileName ,Keys);
         cmd->waitForFinished(10000);
         //qDebug() << cmd->readAllStandardOutput();
-        Parser(Item, cmd->readAllStandardOutput());
+        QTextCodec *codec = QTextCodec::codecForName(CMDCodePage.toUtf8());
+        //qDebug() << codec->toUnicode(cmd->readAllStandardOutput());
+        Parser(Item, codec->toUnicode(cmd->readAllStandardOutput()).toUtf8());
         delete cmd;
     }
 }
@@ -122,17 +151,39 @@ void TSystemInfo::SaveToDB()
 {
     QSqlQuery QueryAdd(DB);
     DB.transaction();
-    QString QueryText = "INSERT INTO LOG ( CAT, SENDER, MSG) VALUES ( "
-                        + QString::number(Code) + ", "
-                        "\'SystemMonitor\', "
-                        "\'" + Msg +"\'"
-                        ")";
+    QString QueryText = "INSERT INTO PARAMS (SENDER, DATE_TIME, CATEGORY, NAME, NUMBER, CURRENT_VALUE) "
+                        "VALUES ('SystemInfo', '%1', '%2', '%3', %4, '%5')";
 
-     if (!QueryAdd.exec(QueryText)) {
-        qDebug() << "FAIL Cannot execute query. Error: " << QueryAdd.lastError().text();
+    for (const auto & Item : Info.toStdMap()) {
+        if (Item.second.UpDate) {
+//           qDebug() << Item.first << Item.second;
+           QueryAdd.bindValue(0, Item.second.DateTime);
+           QueryAdd.bindValue(1, Item.first.Category);
+           QueryAdd.bindValue(2, Item.first.Name);
+           QueryAdd.bindValue(3, Item.first.Number);
+           QueryAdd.bindValue(4, Item.second.Value);
+
+            if (!QueryAdd.exec(QueryText
+                        .arg(Item.second.DateTime.toString("yyyy-MM-dd HH:mm:ss.zzz"))
+                        .arg(Item.first.Category)
+                        .arg(Item.first.Name)
+                        .arg(Item.first.Number)
+                        .arg(Item.second.Value))) {
+               DB.rollback();
+               QString LastError = "Cannot execute query. Error: " + QueryAdd.lastError().text() + " Query: " + QueryAdd.executedQuery();
+               throw std::runtime_error(LastError.toStdString());
+           }
+        }
     }
-    DB.commit();
 
+    if (!DB.commit()) {
+       DB.rollback();
+       QString LastError = "Cannot commit transation. Error: " + DB.lastError().text();
+       throw std::runtime_error(LastError.toStdString());
+    };
+
+    //сбрасываем флаг обновления, если значение поменялось
+    for (auto & Item : Info.toStdMap()) Item.second.UpDate = false;
 }
 
 void TSystemInfo::StartGetInformation()
@@ -140,13 +191,13 @@ void TSystemInfo::StartGetInformation()
     try {
         Updata();
         SaveToDB();
-     //   Print();
+    //    Print();
         SendLogMsg(MSG_CODE::CODE_OK, "Getting information is succesfull");
         qDebug() << "OK";
     }
-    catch (...) {
-        qDebug() << "FAIL";
-        SendLogMsg(MSG_CODE::CODE_ERROR, "Getting information is fail");
+    catch (const std::exception& Ex) {
+        qDebug() << "FAIL " + QString(Ex.what());
+        SendLogMsg(MSG_CODE::CODE_ERROR, "Getting information is fail. Msg:" + QString(Ex.what()));
     }
     emit  GetInformationComplite();
 }
