@@ -9,6 +9,8 @@
 #include <QSettings>
 #include <QtSql/QSqlDatabase>
 #include <QDateTime>
+#include <QWinEventNotifier>
+#include <windows.h>
 #include "info.h"
 
 class TSystemInfo : public QObject
@@ -37,9 +39,11 @@ public:
 
 public slots:
     void StartGetInformation();
+    void ReadCommand(HANDLE hEvent);
 
 signals:
     void GetInformationComplite();
+    void Finished();
 };
 
 

@@ -8,6 +8,7 @@
 #include <QException>
 #include <QRegularExpression>
 #include <QtCore5Compat/QTextCodec> //Если этот модуль не найден, нужно установить Qt 5 Compatibility Module
+#include <iostream>
 
 uint32_t TSystemInfo::NextKey(const QString & OldKey) { //генерирует имя для нового ключа
     if (!CurrentNumberKey.contains(OldKey)) {
@@ -66,9 +67,14 @@ void TSystemInfo::Parser(const QString &Group, const QByteArray &str)
         Value.DateTime = QDateTime::currentDateTime();
 
         if (Info.find(Path) != Info.end()) {
-            if (!(Info[Path].Value != Value.Value)) Value.UpDate = true;
+            if (Info[Path].Value != Value.Value) {
+                Value.UpDate = true;
+                Info[Path].Value = Value.Value;
+                qDebug() << "FIND NEW VALUE";
+            }
         }
         else  {
+        //    qDebug() << "ADD NEW PATH";
             Value.UpDate = true;
             Info.insert(Path, Value);
         }
@@ -96,7 +102,6 @@ TSystemInfo::TSystemInfo(const QString &FileName)
     };
 
     SendLogMsg(MSG_CODE::CODE_OK, "Start is succesfull");
-
 }
 
 TSystemInfo::~TSystemInfo()
@@ -107,6 +112,7 @@ TSystemInfo::~TSystemInfo()
 
 void TSystemInfo::Updata()
 {
+    CurrentNumberKey.clear();
     //получаем путь к файлу с командой wnim
     Config.beginGroup("SYSTEM_INFO");
     QString WMICFileName = Config.value("wmic", "").toString();
@@ -156,7 +162,7 @@ void TSystemInfo::SaveToDB()
 
     for (const auto & Item : Info.toStdMap()) {
         if (Item.second.UpDate) {
-//           qDebug() << Item.first << Item.second;
+        //   qDebug() << Item.first << Item.second;
            QueryAdd.bindValue(0, Item.second.DateTime);
            QueryAdd.bindValue(1, Item.first.Category);
            QueryAdd.bindValue(2, Item.first.Name);
@@ -183,7 +189,7 @@ void TSystemInfo::SaveToDB()
     };
 
     //сбрасываем флаг обновления, если значение поменялось
-    for (auto & Item : Info.toStdMap()) Item.second.UpDate = false;
+    for (auto Item : Info.keys()) Info[Item].UpDate = false;
 }
 
 void TSystemInfo::StartGetInformation()
@@ -200,4 +206,23 @@ void TSystemInfo::StartGetInformation()
         SendLogMsg(MSG_CODE::CODE_ERROR, "Getting information is fail. Msg:" + QString(Ex.what()));
     }
     emit  GetInformationComplite();
+}
+
+void TSystemInfo::ReadCommand(HANDLE hEvent)
+{
+    std::string line;
+    std::getline(std::cin, line);
+    QString Cmd = QString::fromStdString(line);
+    if (Cmd == "TEST") {
+        if (DB.isOpen()) {
+            QSqlQuery QueryTest(DB);
+            if (QueryTest.exec("SELECT FIRST 1 1 FROM LOG")) qDebug() << "OK";
+            else qDebug() << "FAIL Test request to database is fail. Error: " << QueryTest.lastError();
+        }
+        else qDebug() << "FAIL Connect to database is close. Error: " << DB.lastError().text();
+    }
+    else if (Cmd == "QUIT") {
+        qDebug() << "OK";
+        emit Finished();
+    }
 }

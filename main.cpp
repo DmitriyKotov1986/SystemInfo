@@ -1,7 +1,10 @@
 #include <QCoreApplication>
 #include <QTimer>
 #include <QCommandLineParser>
+#include <QWinEventNotifier>
+#include <windows.h>
 #include "tsysteminfo.h"
+
 
 int main(int argc, char *argv[])
 {
@@ -13,7 +16,8 @@ int main(int argc, char *argv[])
     QTimer Timer;
 
     QCommandLineParser parser;
-    parser.setApplicationDescription("Programm for gettin system information");
+    parser.setApplicationDescription("Programm for gettin system information. "
+                                     "While the program is running, you can send a TEST command to test the current state or QUIT to shut down");
     parser.addHelpOption();
     parser.addVersionOption();
 
@@ -41,6 +45,12 @@ int main(int argc, char *argv[])
     QObject::connect(&Timer, SIGNAL(timeout()), &SystemInfo, SLOT(StartGetInformation()));
     //если выполняем чтение один раз то добавляем событие для выхода
     if (SingleShotTimer) QObject::connect(&SystemInfo, SIGNAL(GetInformationComplite()), &a, SLOT(quit()));
+
+    //Обработка консольных команд
+    QWinEventNotifier *m_notifier;
+    m_notifier = new QWinEventNotifier(GetStdHandle(STD_INPUT_HANDLE));
+    QObject::connect(m_notifier, &QWinEventNotifier::activated, &SystemInfo, &TSystemInfo::ReadCommand);
+    QObject::connect(&SystemInfo, SIGNAL(Finished()), &a, SLOT(quit()));
 
     Timer.start();
 
