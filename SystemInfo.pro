@@ -1,6 +1,6 @@
 QT -= gui
 QT += sql
-QT += core5compat
+QT += network
 
 CONFIG += c++11 console
 CONFIG -= app_bundle
@@ -12,6 +12,8 @@ CONFIG -= app_bundle
 SOURCES += \
         info.cpp \
         main.cpp \
+        taboutsystem.cpp \
+        thttpquery.cpp \
         tsysteminfo.cpp
 
 # Default rules for deployment.
@@ -21,4 +23,6 @@ else: unix:!android: target.path = /opt/$${TARGET}/bin
 
 HEADERS += \
     info.h \
+    taboutsystem.h \
+    thttpquery.h \
     tsysteminfo.h

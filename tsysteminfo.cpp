@@ -7,222 +7,288 @@
 #include <QSqlError>
 #include <QException>
 #include <QRegularExpression>
-#include <QtCore5Compat/QTextCodec> //Если этот модуль не найден, нужно установить Qt 5 Compatibility Module
-#include <iostream>
+#include <QXmlStreamWriter>
+#include <QCoreApplication>
+#include <QFile>
 
-uint32_t TSystemInfo::NextKey(const QString & OldKey) { //генерирует имя для нового ключа
-    if (!CurrentNumberKey.contains(OldKey)) {
-        CurrentNumberKey.insert(OldKey, 0);
-        return 0;
-    }
-    else {
-       ++CurrentNumberKey[OldKey];
-       return CurrentNumberKey[OldKey];
-    }
-}
-
-void TSystemInfo::SendLogMsg(uint16_t Code, const QString &Msg)
+TSystemInfo::TSystemInfo(const QString &ConfigFileName, QObject *parent)
+    : QObject(parent)
 {
-    QString Str(Msg);
-    Str.replace(QRegularExpression("'"), "''");
-   // qDebug() << Str;
-    QSqlQuery QueryLog(DB);
-    DB.transaction();
-    QString QueryText = "INSERT INTO LOG (CATEGORY, SENDER, MSG) VALUES ( "
-                        + QString::number(Code) + ", "
-                        "\'SystemMonitor\', "
-                        "\'" + Str +"\'"
-                        ")";
+    Config = new QSettings(ConfigFileName, QSettings::IniFormat);
 
-     if (!QueryLog.exec(QueryText)) {
-        qDebug() << "FAIL Cannot execute query. Error: " << QueryLog.lastError().text() << " Query: "<< QueryLog.lastQuery();
-        DB.rollback();
-        return;
-    }
-    if (!DB.commit()) {
-        qDebug() << "FAIL Cannot commit transation. Error: " << DB.lastError().text();
-        DB.rollback();
-        return;
-    };
-}
+    Config->beginGroup("DATABASE");
+    DB = QSqlDatabase::addDatabase(Config->value("Driver", "QODBC").toString(), "MainDB");
+    DB.setDatabaseName(Config->value("DataBase", "SystemMonitorDB").toString());
+    DB.setUserName(Config->value("UID", "SYSDBA").toString());
+    DB.setPassword(Config->value("PWD", "MASTERKEY").toString());
+    DB.setConnectOptions(Config->value("ConnectionOprions", "").toString());
+    DB.setPort(Config->value("Port", "3051").toUInt());
+    DB.setHostName(Config->value("Host", "localhost").toString());
+    Config->endGroup();
 
-void TSystemInfo::Parser(const QString &Group, const QByteArray &str)
-{
-    QTextStream TS(str);
+    Config->beginGroup("SYSTEM");
+    UpdateTimer.setInterval(Config->value("Interval", "60000").toInt());
+    UpdateTimer.setSingleShot(false);
+    DebugMode = Config->value("DebugMode", "0").toBool();
+    Config->endGroup();
+    QObject::connect(&UpdateTimer, SIGNAL(timeout()), this, SLOT(onStartGetData()));
 
-    while (!TS.atEnd()) {
-      QString tmp = TS.readLine();
-      if (tmp != "\r") {
-        size_t position = tmp.indexOf('=');
+    Config->beginGroup("SERVER");
+    HTTPServerInfo.AZSCode = Config->value("UID", "000").toString();
+    HTTPServerInfo.Url = "http://" + Config->value("Host", "localhost").toString() + ":" + Config->value("Port", "80").toString() +
+                  "/CGI/SYSTEMINFO&" + HTTPServerInfo.AZSCode +"&" + Config->value("PWD", "123456").toString();
+    HTTPServerInfo.MaxRecord = Config->value("MaxRecord", "10").toUInt();
+    HTTPServerInfo.LastID = Config->value("LastID", "0").toULongLong();
+    Config->endGroup();
 
-        TPathInfo Path;
-        Path.Category = Group;
-        Path.Name = tmp.left(position);
-        Path.Number = NextKey(Path.Category + "/" + Path.Name);
+    AboutSystem = new TAboutSystem(*Config, this);
+    QObject::connect(AboutSystem, SIGNAL(SaveToDB(const QString&,  const QString&, const QString&, const uint16_t, const QString&)),
+                     this, SLOT(onSaveToDB(const QString&,  const QString&, const QString&, const uint16_t, const QString&)));
+    QObject::connect(AboutSystem, SIGNAL(GetDataComplite()), this, SLOT(onGetDataComplite()));
 
-        TInfo Value;
-        Value.Value = tmp.right(tmp.length() - position - 1);
-        Value.Value.chop(1);
-        if (Value.Value == "") Value.Value = "n/a";
-        Value.DateTime = QDateTime::currentDateTime();
-
-        if (Info.find(Path) != Info.end()) {
-            if (Info[Path].Value != Value.Value) {
-                Value.UpDate = true;
-                Info[Path].Value = Value.Value;
-                qDebug() << "FIND NEW VALUE";
-            }
-        }
-        else  {
-        //    qDebug() << "ADD NEW PATH";
-            Value.UpDate = true;
-            Info.insert(Path, Value);
-        }
-      }
-    }
-}
-
-TSystemInfo::TSystemInfo(const QString &FileName)
-    : Config(FileName, QSettings::IniFormat)
-{
-    Config.beginGroup("DATABASE");
-
-    DB = QSqlDatabase::addDatabase(Config.value("Driver", "QODBC").toString(), "MainDB");
-    DB.setDatabaseName(Config.value("DataBase", "SystemMonitorDB").toString());
-    DB.setUserName(Config.value("UID", "SYSDBA").toString());
-    DB.setPassword(Config.value("PWD", "MASTERKEY").toString());
-    DB.setConnectOptions(Config.value("ConnectionOprions", "").toString());
-    DB.setPort(Config.value("Port", "3051").toUInt());
-    DB.setHostName(Config.value("Host", "localhost").toString());
-
-    Config.endGroup();
-
-    if (!DB.open()) {
-        qDebug() << "FAIL. Cannot connect to database. Error: " << DB.lastError().text();
-    };
-
-    SendLogMsg(MSG_CODE::CODE_OK, "Start is succesfull");
+    HTTPQuery = new THTTPQuery(HTTPServerInfo.Url, this);
+    QObject::connect(HTTPQuery, SIGNAL(GetAnswer(const QByteArray &)), this, SLOT(onHTTPGetAnswer(const QByteArray &)));
+    QObject::connect(HTTPQuery, SIGNAL(SendLogMsg(uint16_t, const QString &)), this, SLOT(onSendLogMsg(uint16_t, const QString &)));
+    QObject::connect(HTTPQuery, SIGNAL(ErrorOccurred()), this, SLOT(onHTTPError()));
 }
 
 TSystemInfo::~TSystemInfo()
 {
-    SendLogMsg(MSG_CODE::CODE_OK, "Finished");
+    Config->deleteLater();
+
+    SendLogMsg(MSG_CODE::CODE_OK, "Successfully finished");
     DB.close();
 }
 
-void TSystemInfo::Updata()
+void TSystemInfo::SendLogMsg(uint16_t Category, const QString &Msg)
 {
-    CurrentNumberKey.clear();
-    //получаем путь к файлу с командой wnim
-    Config.beginGroup("SYSTEM_INFO");
-    QString WMICFileName = Config.value("wmic", "").toString();
-    QString CMDCodePage = Config.value("CodePage", "IBM 866").toString();
-    uint32_t GroupListCount = Config.value("GroupCount", 0).toUInt();
-    QStringList GroupList;
-    for (uint32_t i = 0; i < GroupListCount; ++i) GroupList << Config.value("Group" + QString::number(i), "").toString();
-    Config.endGroup();
-
-    for (auto Item : GroupList) {
-        Config.beginGroup(Item);
-        uint32_t Count = Config.value("Count", 0).toUInt();
-        QStringList Keys(Item);
-        Keys << "GET";
-        for (uint32_t i = 0; i < Count; ++i) {
-            Keys << Config.value("Key" + QString::number(i), "").toString();
-            if (i != Count - 1) Keys << ",";
-        }
-        Config.endGroup();
-        Keys << "/FORMAT:LIST";
-
-        //выполняем команду
-        QProcess *cmd = new QProcess();
-        cmd->start(WMICFileName ,Keys);
-        cmd->waitForFinished(10000);
-        //qDebug() << cmd->readAllStandardOutput();
-        QTextCodec *codec = QTextCodec::codecForName(CMDCodePage.toUtf8());
-        //qDebug() << codec->toUnicode(cmd->readAllStandardOutput());
-        Parser(Item, codec->toUnicode(cmd->readAllStandardOutput()).toUtf8());
-        delete cmd;
+    if (DebugMode) {
+        qDebug() << Msg;
     }
+    QSqlQuery QueryLog(DB);
+    DB.transaction();
+    QString QueryText = "INSERT INTO LOG (CATEGORY, SENDER, MSG) VALUES ( "
+                        + QString::number(Category) + ", "
+                        "\'SystemInfo\', "
+                        "\'" + Msg +"\'"
+                        ")";
+
+    if (!QueryLog.exec(QueryText)) {
+        qDebug() << "FAIL Cannot execute query. Error: " << QueryLog.lastError().text() << " Query: "<< QueryLog.lastQuery();
+        DB.rollback();
+        exit(-1);
+    }
+    if (!DB.commit()) {
+        qDebug() << "FAIL Cannot commit transation. Error: " << DB.lastError().text();
+        DB.rollback();
+        exit(-2);
+    };
 }
 
-void TSystemInfo::Print()
+void TSystemInfo::onSendLogMsg(uint16_t Category, const QString &Msg)
 {
-    for (const auto & Item: Info.toStdMap()) {
-        qDebug() << Item.first << Item.second;
-    }
+    SendLogMsg(Category, Msg);
 }
 
-void TSystemInfo::SaveToDB()
+void TSystemInfo::onStartGetData()
 {
+//    qDebug() << "timeout updatetimer";
+    if (GettingInformation) {
+        return;
+    }
+
+    TimeOfRun = QTime::currentTime();
+    if (DebugMode)  {
+        qDebug() << "Start get information about systems. Time:" << TimeOfRun.msecsTo(QTime::currentTime()) << "ms" ;
+    }
+
+    GettingInformation = true;
+    AboutSystem->UpdataAboutSystem();
+}
+
+void TSystemInfo::onGetDataComplite()
+{
+    if (DebugMode)  {
+        qDebug() << "System data received successfully. Save to DB. Time:" << TimeOfRun.msecsTo(QTime::currentTime()) << "ms" ;
+    }
+
     QSqlQuery QueryAdd(DB);
     DB.transaction();
-    QString QueryText = "INSERT INTO PARAMS (SENDER, DATE_TIME, CATEGORY, NAME, NUMBER, CURRENT_VALUE) "
-                        "VALUES ('SystemInfo', '%1', '%2', '%3', %4, '%5')";
 
-    for (const auto & Item : Info.toStdMap()) {
-        if (Item.second.UpDate) {
-        //   qDebug() << Item.first << Item.second;
-           QueryAdd.bindValue(0, Item.second.DateTime);
-           QueryAdd.bindValue(1, Item.first.Category);
-           QueryAdd.bindValue(2, Item.first.Name);
-           QueryAdd.bindValue(3, Item.first.Number);
-           QueryAdd.bindValue(4, Item.second.Value);
-
-            if (!QueryAdd.exec(QueryText
-                        .arg(Item.second.DateTime.toString("yyyy-MM-dd HH:mm:ss.zzz"))
-                        .arg(Item.first.Category)
-                        .arg(Item.first.Name)
-                        .arg(Item.first.Number)
-                        .arg(Item.second.Value))) {
-               DB.rollback();
-               QString LastError = "Cannot execute query. Error: " + QueryAdd.lastError().text() + " Query: " + QueryAdd.executedQuery();
-               throw std::runtime_error(LastError.toStdString());
-           }
+    while(!QueueSaveToDB.isEmpty()) {
+        TSaveToDBItem tmp = QueueSaveToDB.dequeue();
+        QString QueryText = "INSERT INTO \"PARAMS\" (\"DATE_TIME\", \"SENDER\", \"CATEGORY\", \"NAME\", \"NUMBER\", \"CURRENT_VALUE\") VALUES ("
+                            "'" + tmp.DateTime.toString("yyyy-MM-dd hh:mm:ss.zzz") + "', " +
+                            "'" + tmp.Sender + "', " +
+                            "'" + tmp.Category + "', " +
+                            "'" + tmp.Name + "', " +
+                            QString::number(tmp.Number) + ", " +
+                            "'" + tmp.Value.toUtf8().toBase64() + "')";
+       // qDebug() << QueryText;
+        if (!QueryAdd.exec(QueryText)) {
+             DB.rollback();
+            qDebug() << "Cannot execute query. Error: " + QueryAdd.lastError().text() + " Query: " + QueryAdd.executedQuery();
+            exit(-2);
         }
     }
+    if (!DB.commit()) {
+        DB.rollback();
+        qDebug() << "Cannot commit transation. Error: " + DB.lastError().text();
+        exit(-4);
+    };
+
+    GettingInformation = false;
+
+    SendToHTTPServer();
+}
+
+void TSystemInfo::onHTTPGetAnswer(const QByteArray &Answer)
+{
+    if (DebugMode)  {
+        qDebug() << "Received a response from the server. Time:" << TimeOfRun.msecsTo(QTime::currentTime()) << "ms" ;
+    }
+
+    if (Answer.left(2) == "OK") {
+         QSqlQuery Query(DB);
+         DB.transaction();
+         for (auto Item : HTTPServerInfo.DeleteID) {
+             QString QueryText = "DELETE FROM PARAMS "
+                                 "WHERE ID = " + QString::number(Item);
+             if (!Query.exec(QueryText)) {
+                 DB.rollback();
+                 qDebug() << "Cannot execute query. Error: " + Query.lastError().text() + " Query: " + QueryText;
+                 exit(-2);
+             }
+         }
+
+
+         if (!DB.commit()) {
+            DB.rollback();
+            qDebug() << "Cannot commit transation. Error: " + DB.lastError().text();
+            exit(-4);
+         };
+
+         HTTPServerInfo.DeleteID.clear();
+
+         SendLogMsg(TSystemInfo::CODE_INFORMATION, "Data has been successfully sent to the server."
+             " LastID: " + QString::number(HTTPServerInfo.CurrentLastID));
+
+         HTTPServerInfo.LastID = HTTPServerInfo.CurrentLastID;
+
+         Config->beginGroup("SERVER");
+         Config->setValue("LastID", HTTPServerInfo.LastID);
+         Config->endGroup();
+    }
+    else {
+        SendLogMsg(MSG_CODE::CODE_ERROR, "Failed to send data to the server. Server answer: " + Answer);
+    }
+
+    Sending = false;
+}
+
+void TSystemInfo::onHTTPError()
+{
+    Sending = false;
+    if (DebugMode) {
+        qDebug() << "Error getting anwser from HTTP Server. Retry. Time:" << TimeOfRun.msecsTo(QTime::currentTime()) << "ms";
+    }
+
+    if (!XMLStr.isEmpty()) HTTPQuery->Run(XMLStr);
+}
+
+void TSystemInfo::SendToHTTPServer()
+{
+    if (Sending) {
+        SendLogMsg(MSG_CODE::CODE_INFORMATION, "Previous request has not been processed yet. Skipped.");
+        return;
+    }
+
+    QSqlQuery Query(DB);
+    DB.transaction();
+
+    QString QueryText = "SELECT FIRST " + QString::number(HTTPServerInfo.MaxRecord) + " " +
+                        "ID, DATE_TIME, SENDER, CATEGORY, NAME, NUMBER, CURRENT_VALUE "
+                        "FROM PARAMS "
+                        "WHERE ID > " + QString::number(HTTPServerInfo.LastID) + " "
+                        "ORDER BY ID";
+
+
+    if (!Query.exec(QueryText)) {
+        DB.rollback();
+        qDebug() << "Cannot execute query. Error: " + Query.lastError().text() + " Query: " + QueryText;
+        exit(-2);
+    }
+    //форматируем XML документ
+    XMLStr.clear();
+    QXmlStreamWriter XMLWriter(&XMLStr);
+    XMLWriter.setAutoFormatting(true);
+    XMLWriter.writeStartDocument("1.0");
+    XMLWriter.writeStartElement("Root");
+    XMLWriter.writeTextElement("AZSCode", HTTPServerInfo.AZSCode);
+    XMLWriter.writeTextElement("ClientVersion", QCoreApplication::applicationVersion());
+    while (Query.next()) {
+        XMLWriter.writeStartElement("SystemInfo");
+        XMLWriter.writeTextElement("DateTime", Query.value("DATE_TIME").toDateTime().toString("yyyy-MM-dd hh:mm:ss.zzz"));
+        XMLWriter.writeTextElement("Sender", Query.value("SENDER").toString());
+        XMLWriter.writeTextElement("Category", Query.value("CATEGORY").toString());
+        XMLWriter.writeTextElement("Name", Query.value("NAME").toString());
+        XMLWriter.writeTextElement("Number", Query.value("NUMBER").toString());
+
+//        XMLWriter.writeTextElement("CurrentValue", Codec->toUnicode(Query.value("CURRENT_VALUE").toByteArray()));
+        XMLWriter.writeTextElement("CurrentValue", Query.value("CURRENT_VALUE").toString());
+       // QTextCodec *Codec = QTextCodec::codecForName("Windows-1251");
+       // qDebug() << "->" <<  Codec->fromUnicode(Query.value("CURRENT_VALUE").toByteArray());//Codec->toUnicode(Query.value("CURRENT_VALUE").toByteArray());
+        XMLWriter.writeEndElement();
+        HTTPServerInfo.DeleteID.push_back(Query.value("ID").toLongLong());
+    }
+
+    if (Query.last()) HTTPServerInfo.CurrentLastID = Query.value("ID").toUInt();
+
+    XMLWriter.writeEndElement();
+    XMLWriter.writeEndDocument();
 
     if (!DB.commit()) {
        DB.rollback();
-       QString LastError = "Cannot commit transation. Error: " + DB.lastError().text();
-       throw std::runtime_error(LastError.toStdString());
+       qDebug() << "Cannot commit transation. Error: " + DB.lastError().text();
+       exit(-4);
     };
 
-    //сбрасываем флаг обновления, если значение поменялось
-    for (auto Item : Info.keys()) Info[Item].UpDate = false;
+  //  qDebug() << XMLStr;
+
+    if (DebugMode)  {
+        qDebug() << "Send data to server. Time:" << TimeOfRun.msecsTo(QTime::currentTime()) << "ms" ;
+    }
+
+ /*   QFile file("SI.xml");
+    file.open(QIODevice::WriteOnly);
+    file.write(XMLStr);
+    file.close();*/
+
+    HTTPQuery->Run(XMLStr);
 }
 
-void TSystemInfo::StartGetInformation()
+void TSystemInfo::onStart()
 {
-    try {
-        Updata();
-        SaveToDB();
-    //    Print();
-        SendLogMsg(MSG_CODE::CODE_OK, "Getting information is succesfull");
-        qDebug() << "OK";
-    }
-    catch (const std::exception& Ex) {
-        qDebug() << "FAIL " + QString(Ex.what());
-        SendLogMsg(MSG_CODE::CODE_ERROR, "Getting information is fail. Msg:" + QString(Ex.what()));
-    }
-    emit  GetInformationComplite();
+    if (!DB.open()) {
+        qCritical() << "Cannot connect to database. Error: " << DB.lastError().text();
+        exit(-1);
+    };
+
+    SendLogMsg(MSG_CODE::CODE_OK, "Successfully started");
+
+    onStartGetData();
+
+    UpdateTimer.start(); //запускаем таймер обновления данных
 }
 
-void TSystemInfo::ReadCommand(HANDLE hEvent)
+void TSystemInfo::onSaveToDB(const QString &Sender, const QString &Category, const QString &Name, const uint16_t Number, const QString &Value)
 {
-    std::string line;
-    std::getline(std::cin, line);
-    QString Cmd = QString::fromStdString(line);
-    if (Cmd == "TEST") {
-        if (DB.isOpen()) {
-            QSqlQuery QueryTest(DB);
-            if (QueryTest.exec("SELECT FIRST 1 1 FROM LOG")) qDebug() << "OK";
-            else qDebug() << "FAIL Test request to database is fail. Error: " << QueryTest.lastError();
-        }
-        else qDebug() << "FAIL Connect to database is close. Error: " << DB.lastError().text();
-    }
-    else if (Cmd == "QUIT") {
-        qDebug() << "OK";
-        emit Finished();
-    }
+    TSaveToDBItem tmp;
+    tmp.DateTime = QDateTime::currentDateTime();
+    tmp.Sender = Sender;
+    tmp.Category = Category;
+    tmp.Name = Name;
+    tmp.Number = Number;
+    tmp.Value = Value;
+    QueueSaveToDB.enqueue(tmp);
 }

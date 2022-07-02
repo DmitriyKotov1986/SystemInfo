@@ -7,7 +7,6 @@
 
 struct TInfo {
     QString Value;
-    QDateTime DateTime;
     bool UpDate = true;
 };
 

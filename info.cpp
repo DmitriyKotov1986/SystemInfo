@@ -2,7 +2,7 @@
 
 //TInfo operators
 QDebug operator << (QDebug QD, const TInfo Info) {
-    QString Str = Info.Value + "-" + Info.DateTime.toString(Qt::TextDate) + " UPDATE:" + (Info.UpDate ? "TRUE" : "FALSE");
+    QString Str = Info.Value + " UPDATE:" + (Info.UpDate ? "TRUE" : "FALSE");
     QD << Str;
     return QD;
 }
